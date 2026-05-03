@@ -56,171 +56,177 @@ def find_file_by_suffix(root_path, suffix):
 
 def calculate_steps_from_coordinates(cbf_data, voxel_size_h, voxel_size_v):
     """
-    Calculates the physical step size between tiles in PIXELS based on stage coordinates.
-    Assumes stage units are in Nanometers (1e-3 microns), common for Inscoper.
+    Calculates tile step sizes in pixels and builds an explicit (row, col) mapping
+    for every folder index, based on stage coordinates.
+
+    Stage convention (Inscoper):
+      Axis1 (X) -> Image Horizontal axis (columns).  Largest X = column 0.
+      Axis2 (Y) -> Image Vertical axis   (rows).     Largest Y = row 0.
+
+    Returns: step_pixels_h, step_pixels_v, grid_cols, grid_rows, tile_layout
+      tile_layout[i] = (row, col) for folder image_xy{i}.
     """
     print("\n--- Calculating Precise Steps from Stage Coordinates ---")
-    
+
     try:
         mosaic = cbf_data['mda']['list'][0]['mosaic']['MosaicElems'][0]
         positions_list = mosaic['Positions']
-        
-        # We need at least 2 points to calculate a step
-        if len(positions_list) < 2:
-            print("  - Warning: Not enough positions to calculate overlap. Defaulting to 10% overlap.")
-            return 2048 * 0.9, 2048 * 0.9, 1, 1
 
-        # 1. Extract X and Y stage coordinates for all positions
+        if len(positions_list) < 2:
+            print("  - Warning: Not enough positions. Defaulting to 10% overlap.")
+            return 2048 * 0.9, 2048 * 0.9, 1, 1, [(0, 0)]
+
+        # 1. Extract Axis1 (X) and Axis2 (Y) stage coordinates for every position.
         coords = []
         for pos in positions_list:
             x = 0.0
             y = 0.0
             for device in pos['devices']:
-                # Axis1 is usually Stage X, Axis2 is usually Stage Y
-                if "Axis1AbsolutePosition" in device['Id'].get('SubDeviceId', ''):
+                sid = device['Id'].get('SubDeviceId', '')
+                if 'Axis1AbsolutePosition' in sid:
                     x = float(device['Value'])
-                elif "Axis2AbsolutePosition" in device['Id'].get('SubDeviceId', ''):
+                elif 'Axis2AbsolutePosition' in sid:
                     y = float(device['Value'])
             coords.append((x, y))
 
-        # 2. Determine Grid Layout and Axis Mapping
-        # User Requirement: Index 0 is Top-Left. Index 1 is to the Right (Horizontal Neighbor).
-        # We check coordinate change between Index 0 and Index 1 to see which Stage Axis corresponds to Image Horizontal.
-        
-        p0 = coords[0]
-        p1 = coords[1]
-        
-        dx_01 = abs(p1[0] - p0[0])
-        dy_01 = abs(p1[1] - p0[1])
-        
-        # Heuristic: The axis with the larger change between idx 0 and 1 is the Horizontal Axis.
-        if dx_01 > dy_01:
-            print("  - Detected: Stage X corresponds to Image Horizontal (Row-Major filling).")
-            # H step is driven by X, V step is driven by Y
-            h_stage_vals = [c[0] for c in coords]
-            v_stage_vals = [c[1] for c in coords]
-        else:
-            print("  - Detected: Stage Y corresponds to Image Horizontal (Row-Major filling).")
-            # H step is driven by Y, V step is driven by X
-            h_stage_vals = [c[1] for c in coords]
-            v_stage_vals = [c[0] for c in coords]
+        # 2. Derive the grid layout directly from unique coordinate values.
+        #    Round to the nearest 100 nm to absorb stage jitter.
+        #    Axis1 (X) -> columns: sort descending so the most-positive X is col 0.
+        #    Axis2 (Y) -> rows:    sort descending so the most-positive Y is row 0.
+        unique_x = sorted(set(round(c[0], -2) for c in coords), reverse=True)
+        unique_y = sorted(set(round(c[1], -2) for c in coords), reverse=True)
 
-        # 3. Calculate Average Steps (Delta) in Stage Units
-        # We find unique values to determine grid dimensions and average step
-        
-        # Rounding to nearest 100 units to group slightly jittered positions
-        unique_h = sorted(list(set([round(v, -2) for v in h_stage_vals])))
-        unique_v = sorted(list(set([round(v, -2) for v in v_stage_vals])))
-        
-        grid_width = len(unique_h) # Number of columns
-        grid_height = len(unique_v) # Number of rows
-        
-        print(f"  - Grid Dimensions Detected: {grid_width} Cols x {grid_height} Rows")
+        grid_cols = len(unique_x)
+        grid_rows = len(unique_y)
+        print(f"  - Grid Dimensions Detected: {grid_cols} Cols x {grid_rows} Rows")
 
-        # Calculate H Step (Horizontal)
-        if grid_width > 1:
-            steps_h = [abs(unique_h[i+1] - unique_h[i]) for i in range(len(unique_h)-1)]
-            avg_step_stage_h = sum(steps_h) / len(steps_h)
+        # 3. Calculate average step in stage units (nm) along each axis.
+        if grid_cols > 1:
+            steps_x = [abs(unique_x[i] - unique_x[i + 1]) for i in range(grid_cols - 1)]
+            avg_step_x = sum(steps_x) / len(steps_x)
         else:
-            avg_step_stage_h = 0
-            
-        # Calculate V Step (Vertical)
-        if grid_height > 1:
-            steps_v = [abs(unique_v[i+1] - unique_v[i]) for i in range(len(unique_v)-1)]
-            avg_step_stage_v = sum(steps_v) / len(steps_v)
-        else:
-            avg_step_stage_v = 0
-            
-        # 4. Convert Stage Units to Pixels
-        # Assumption: Stage units are Nanometers (1e-3 microns). 
-        # Verification: Typical step is ~2.6e6. 2.6e6 * 1e-3 = 2660um. FOV is ~2900um. Matches.
-        
-        step_microns_h = avg_step_stage_h * 1e-3
-        step_microns_v = avg_step_stage_v * 1e-3
-        
-        step_pixels_h = step_microns_h / voxel_size_h
-        step_pixels_v = step_microns_v / voxel_size_v
-        
-        # Fallback if single row/col
-        if step_pixels_h == 0: step_pixels_h = 2048 * 0.9 # Default 10% overlap
-        if step_pixels_v == 0: step_pixels_v = 2048 * 0.9
+            avg_step_x = 0
 
-        print(f"  - Calculated Step H: {step_pixels_h:.2f} pixels ({step_microns_h:.2f} um)")
-        print(f"  - Calculated Step V: {step_pixels_v:.2f} pixels ({step_microns_v:.2f} um)")
-        
-        return step_pixels_h, step_pixels_v, grid_width, grid_height
+        if grid_rows > 1:
+            steps_y = [abs(unique_y[i] - unique_y[i + 1]) for i in range(grid_rows - 1)]
+            avg_step_y = sum(steps_y) / len(steps_y)
+        else:
+            avg_step_y = 0
+
+        # 4. Convert nm -> µm -> pixels.
+        step_pixels_h = (avg_step_x * 1e-3) / voxel_size_h if avg_step_x else 2048 * 0.9
+        step_pixels_v = (avg_step_y * 1e-3) / voxel_size_v if avg_step_y else 2048 * 0.9
+
+        print(f"  - Calculated Step H: {step_pixels_h:.2f} pixels ({avg_step_x * 1e-3:.2f} um)")
+        print(f"  - Calculated Step V: {step_pixels_v:.2f} pixels ({avg_step_y * 1e-3:.2f} um)")
+
+        # 5. Build (row, col) for every folder index using the coordinate lookup.
+        x_to_col = {x: i for i, x in enumerate(unique_x)}
+        y_to_row = {y: i for i, y in enumerate(unique_y)}
+
+        tile_layout = []
+        for i, (x, y) in enumerate(coords):
+            col = x_to_col[round(x, -2)]
+            row = y_to_row[round(y, -2)]
+            tile_layout.append((row, col))
+
+        return step_pixels_h, step_pixels_v, grid_cols, grid_rows, tile_layout
 
     except Exception as e:
         print(f"  - Error during coordinate calculation: {e}")
         print("  - Fallback: Using default theoretical overlap (10%).")
-        return 2048*0.9, 2048*0.9, 5, 5 # Fallback defaults
+        fallback_n = 25
+        return 2048 * 0.9, 2048 * 0.9, 5, 5, [(i // 5, i % 5) for i in range(fallback_n)]
 
 
 def parse_metadata(cbf_path, ome_path):
     """Parses metadata files to extract experiment parameters."""
     params = {}
     print("Parsing metadata...")
-    try:
-        with open(cbf_path, 'r', encoding='utf-8') as f:
-            cbf_data = json.load(f)
-        
-        # Get Image Dimensions (assume 2048 if missing, as legacy 240 is definitely wrong)
-        # Note: 'IMAGE WIDTH' is inside the 'Settings' list or 'PresetChannel', searching recursively is safer,
-        # but for this specific file structure we check the first available camera setting.
-        try:
-             # Basic fallback
-            img_width = 2048 
-            img_height = 2048
-            # Try to find in cameras
-            for cam in cbf_data.get('ROIs', {}).get('PresetChannel', []):
-                 for dev in cam.get('devices', []):
-                     if dev.get('Id', {}).get('SubDeviceId') == 'IMAGE WIDTH':
-                         img_width = int(dev['Value'])
-                     if dev.get('Id', {}).get('SubDeviceId') == 'IMAGE HEIGHT':
-                         img_height = int(dev['Value'])
-        except:
-            img_width = 2048
-            img_height = 2048
 
-        params['img_width_px'] = img_width
-        params['img_height_px'] = img_height
-        
-        # Calculate Steps in Pixels
-        step_h_px, step_v_px, grid_w, grid_h = calculate_steps_from_coordinates(
-            cbf_data, VOXEL_SIZE_OVERRIDE["H"], VOXEL_SIZE_OVERRIDE["V"]
-        )
-
-        params['step_H_px'] = floor(step_h_px)
-        params['step_V_px'] = floor(step_v_px)
-        params['gridH'] = grid_w
-        params['gridV'] = grid_h
-
-        # Calculate estimated overlap for report
-        ov_h = 1.0 - (step_h_px / img_width)
-        print(f"  - Effective Overlap H: {ov_h*100:.2f}%")
-        
-    except Exception as e:
-        print(f"Error parsing CBF file '{cbf_path}': {e}")
-        return None
-
+    # --- Step 1: Read OME-XML first to get authoritative voxel sizes ---
+    voxel_h = VOXEL_SIZE_OVERRIDE["H"]
+    voxel_v = VOXEL_SIZE_OVERRIDE["V"]
+    img_width_ome  = 2048
+    img_height_ome = 2048
     try:
         tree = ET.parse(ome_path)
         root = tree.getroot()
         ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
         pixels_node = root.find('ome:Image/ome:Pixels', ns)
-        if pixels_node is None: raise ValueError("Pixels node not found in OME-XML.")
-        
-        params.update({
-            'no_slices_metadata': int(pixels_node.get('SizeZ'))
-        })
+        if pixels_node is None:
+            raise ValueError("Pixels node not found in OME-XML.")
+
+        params['no_slices_metadata'] = int(pixels_node.get('SizeZ'))
+
+        # Image pixel dimensions
+        if pixels_node.get('SizeX'):
+            img_width_ome  = int(pixels_node.get('SizeX'))
+        if pixels_node.get('SizeY'):
+            img_height_ome = int(pixels_node.get('SizeY'))
+
+        # Physical voxel sizes — prefer OME-XML over the hardcoded override
+        unit_to_um = {'nm': 1e-3, 'um': 1.0, 'µm': 1.0, 'mm': 1e3}
+        phys_x_str  = pixels_node.get('PhysicalSizeX')
+        phys_y_str  = pixels_node.get('PhysicalSizeY')
+        phys_x_unit = pixels_node.get('PhysicalSizeXUnit', 'um')
+        phys_y_unit = pixels_node.get('PhysicalSizeYUnit', 'um')
+
+        if phys_x_str and phys_y_str:
+            voxel_h = float(phys_x_str) * unit_to_um.get(phys_x_unit, 1.0)
+            voxel_v = float(phys_y_str) * unit_to_um.get(phys_y_unit, 1.0)
+            print(f"  - Voxel size from OME-XML: H={voxel_h:.4f} µm, V={voxel_v:.4f} µm")
+        else:
+            print(f"  - PhysicalSize not in OME-XML. Using override: {voxel_h} µm")
+
     except Exception as e:
         print(f"Error parsing OME-XML file '{ome_path}': {e}")
         return None
 
-    params['voxel_H'] = VOXEL_SIZE_OVERRIDE["H"]
-    params['voxel_V'] = VOXEL_SIZE_OVERRIDE["V"]
+    # --- Step 2: Read CBF and calculate tile layout with correct voxel sizes ---
+    try:
+        with open(cbf_path, 'r', encoding='utf-8') as f:
+            cbf_data = json.load(f)
+
+        # Image pixel dimensions from CBF (fall back to OME-XML values)
+        img_width  = img_width_ome
+        img_height = img_height_ome
+        try:
+            for cam in cbf_data.get('ROIs', {}).get('PresetChannel', []):
+                for dev in cam.get('devices', []):
+                    sid = dev.get('Id', {}).get('SubDeviceId', '')
+                    if sid == 'IMAGE WIDTH':
+                        img_width  = int(dev['Value'])
+                    elif sid == 'IMAGE HEIGHT':
+                        img_height = int(dev['Value'])
+        except Exception:
+            pass
+
+        params['img_width_px']  = img_width
+        params['img_height_px'] = img_height
+
+        # Calculate tile steps and layout using the correct voxel sizes
+        step_h_px, step_v_px, grid_w, grid_h, tile_layout = calculate_steps_from_coordinates(
+            cbf_data, voxel_h, voxel_v
+        )
+
+        params['step_H_px']    = floor(step_h_px)
+        params['step_V_px']    = floor(step_v_px)
+        params['gridH']        = grid_w
+        params['gridV']        = grid_h
+        params['tile_layout']  = tile_layout
+
+        ov_h = 1.0 - (step_h_px / img_width)
+        print(f"  - Effective Overlap H: {ov_h * 100:.2f}%")
+
+    except Exception as e:
+        print(f"Error parsing CBF file '{cbf_path}': {e}")
+        return None
+
+    params['voxel_H']   = voxel_h
+    params['voxel_V']   = voxel_v
     params['z_spacing'] = VOXEL_SIZE_OVERRIDE["D"]
-    
+
     return params
 
 
@@ -274,16 +280,12 @@ def generate_terastitcher_xml(output_path, params, data_folder, channel_idx, sli
     """Generates the TeraStitcher import XML."""
     print(f"Generating XML for Channel {channel_idx} -> {os.path.basename(output_path)}")
 
-    # --- CORRECTION START ---
-    # Mechanical displacements in the XML Header must be in MICRONS (Physical Units)
-    # because voxel_dims are defined in microns.
-    # We multiply the pixel step by the voxel size.
+    # Mechanical displacements in the XML header must be in MICRONS (physical units).
     mech_disp_H_microns = params['step_H_px'] * params['voxel_H']
     mech_disp_V_microns = params['step_V_px'] * params['voxel_V']
-    # --- CORRECTION END ---
-    
-    # Dimensions in microns
-    vxl_V = params['voxel_H']
+
+    # Voxel dimensions in microns
+    vxl_V = params['voxel_V']
     vxl_H = params['voxel_H']
     vxl_D = params['z_spacing']
 
@@ -302,7 +304,6 @@ def generate_terastitcher_xml(output_path, params, data_folder, channel_idx, sli
     ET.SubElement(terastitcher_node, 'voxel_dims', V=str(vxl_V), H=str(vxl_H), D=str(vxl_D))
     ET.SubElement(terastitcher_node, 'origin', V="0", H="0", D="0")
     
-    # --- UPDATED LINE BELOW ---
     ET.SubElement(terastitcher_node, 'mechanical_displacements', V=str(mech_disp_V_microns), H=str(mech_disp_H_microns))
     
     ET.SubElement(terastitcher_node, 'dimensions',
@@ -311,18 +312,22 @@ def generate_terastitcher_xml(output_path, params, data_folder, channel_idx, sli
                stack_slices=str(slice_count))
 
     stacks_node = ET.SubElement(terastitcher_node, 'STACKS')
-    
+
+    # Build reverse lookup: (row, col) -> folder index, from the stage-coordinate mapping.
+    layout_map = {(r, c): idx for idx, (r, c) in enumerate(params['tile_layout'])}
+
     for row in range(params['gridV']):
         for col in range(params['gridH']):
-            
-            # NOTE: ABS_V and ABS_H inside the Stack elements MUST remain in PIXELS.
-            # TeraStitcher expects raw coordinates here.
+
+            # ABS_V and ABS_H must be in pixels.
             abs_H_eff = col * params['step_H_px']
             abs_V_eff = row * params['step_V_px']
-            
-            folder_index = row * params['gridH'] + col
+
+            folder_index = layout_map.get((row, col))
+            if folder_index is None:
+                continue  # skip absent tiles in a sparse grid
             dir_name = TILE_FOLDER_FORMAT.format(index=folder_index)
-            
+
             stack_attribs = {
                 'N_CHANS': "1",
                 'N_BYTESxCHAN': "2",
