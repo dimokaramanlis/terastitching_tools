@@ -1,17 +1,9 @@
 #!/usr/bin/env python
 """
 This script automatically generates a TeraStitcher XML descriptor and execution
-script for a SINGLE selected channel.
-
-CORRECTIONS (2025-12-03):
-1. Fixed tiling inaccuracies by calculating step sizes directly from stage coordinate deltas.
-2. Removed legacy 240px dimension constraints; now uses actual image dimensions (2048px).
-3. Enforces Row-Major indexing (Index 0=Top-Left, Index 1=Right) by dynamically mapping 
-   stage axes to image axes.
-4. Solved ambiguity where "20% overlap" effectively meant "10% intersection".
-
+script for MULTI-CHANNEL datasets using exact stage coordinates from CBF metadata.
 Author: DK & Gemini
-Date: December 03, 2025
+Date: January 08, 2026
 """
 import os
 import sys
@@ -20,15 +12,15 @@ import re
 import xml.etree.ElementTree as ET
 from tkinter import Tk, filedialog
 from xml.dom import minidom
-from math import floor, sqrt
+from math import floor
 
 # --- CONFIGURABLE PARAMETERS ---
 
 # 1. USER OVERRIDES
-VOXEL_SIZE_OVERRIDE = {
-    "H": 1.44,  # Voxel size in microns (X-axis / Horizontal)
-    "V": 1.44,  # Voxel size in microns (Y-axis / Vertical)
-    "D": 5.0    # Z-spacing in microns
+VOXEL_SIZE_FALLBACK = {
+    "H": 1.44,   # Voxel size in microns (X-axis / Horizontal) - Locked to empirically true value
+    "V": 1.44,   # Voxel size in microns (Y-axis / Vertical)   - Locked to empirically true value
+    "D": 5.0     # Z-spacing in microns
 }
 
 # 2. Metadata File Names
@@ -40,7 +32,7 @@ TILE_FOLDER_FORMAT = "image_xy{index}"
 
 # 4. TeraStitcher Execution Parameters
 DEFAULT_STITCHING_PARAMS = {
-    "sV": 20, "sH": 20, "sD": 20,
+    "sV": 25, "sH": 25, "sD": 20,
     "displ_threshold": 0.8,
     "imout_depth": 16, "subvoldim": 100
 }
@@ -48,187 +40,174 @@ DEFAULT_STITCHING_PARAMS = {
 
 
 def find_file_by_suffix(root_path, suffix):
-    """Finds the first file in a directory with a given suffix."""
     for item in os.listdir(root_path):
-        if item.endswith(suffix):
-            return os.path.join(root_path, item)
+        if item.endswith(suffix): return os.path.join(root_path, item)
     return None
 
-def calculate_steps_from_coordinates(cbf_data, voxel_size_h, voxel_size_v):
-    """
-    Calculates the physical step size between tiles in PIXELS based on stage coordinates.
-    Assumes stage units are in Nanometers (1e-3 microns), common for Inscoper.
-    """
-    print("\n--- Calculating Precise Steps from Stage Coordinates ---")
+def extract_positions_from_cbf(cbf_data, params):
+    """Extracts exact absolute positions from the CBF JSON structure."""
+    mosaic = None
+    for item in cbf_data.get('mda', {}).get('list', []):
+        if 'mosaic' in item:
+            mosaic = item['mosaic']['MosaicElems'][0]
+            break
+            
+    if not mosaic:
+        return None
+
+    positions = mosaic.get('Positions', [])
     
-    try:
-        mosaic = cbf_data['mda']['list'][0]['mosaic']['MosaicElems'][0]
-        positions_list = mosaic['Positions']
-        
-        # We need at least 2 points to calculate a step
-        if len(positions_list) < 2:
-            print("  - Warning: Not enough positions to calculate overlap. Defaulting to 10% overlap.")
-            return 2048 * 0.9, 2048 * 0.9, 1, 1
+    coords = []
+    for pos in positions:
+        val_x, val_y = 0, 0
+        for dev in pos.get('devices', []):
+            dev_id = dev.get('Id', {}).get('SubDeviceId', '')
+            # Mapping Axis2 to X/H and Axis1 to Y/V based on the stage configuration
+            if dev_id == 'Axis2AbsolutePosition':
+                val_x = dev.get('Value', 0)
+            elif dev_id == 'Axis1AbsolutePosition':
+                val_y = dev.get('Value', 0)
+        coords.append((val_x, val_y))
 
-        # 1. Extract X and Y stage coordinates for all positions
-        coords = []
-        for pos in positions_list:
-            x = 0.0
-            y = 0.0
-            for device in pos['devices']:
-                # Axis1 is usually Stage X, Axis2 is usually Stage Y
-                if "Axis1AbsolutePosition" in device['Id'].get('SubDeviceId', ''):
-                    x = float(device['Value'])
-                elif "Axis2AbsolutePosition" in device['Id'].get('SubDeviceId', ''):
-                    y = float(device['Value'])
-            coords.append((x, y))
+    # To match image coordinate space (top-left is 0,0; increasing down/right),
+    # we invert the microscope stage coordinates using the max value as the origin.
+    max_x = max(c[0] for c in coords)
+    max_y = max(c[1] for c in coords)
+    
+    # Robust fallback for nominal step size mapping
+    step_x_nm = mosaic.get('UserOffsetX')
+    if not step_x_nm:
+        unique_x = sorted(list(set(c[0] for c in coords)))
+        step_x_nm = unique_x[1] - unique_x[0] if len(unique_x) > 1 else 1
 
-        # 2. Determine Grid Layout and Axis Mapping
-        # User Requirement: Index 0 is Top-Left. Index 1 is to the Right (Horizontal Neighbor).
-        # We check coordinate change between Index 0 and Index 1 to see which Stage Axis corresponds to Image Horizontal.
-        
-        p0 = coords[0]
-        p1 = coords[1]
-        
-        dx_01 = abs(p1[0] - p0[0])
-        dy_01 = abs(p1[1] - p0[1])
-        
-        # Heuristic: The axis with the larger change between idx 0 and 1 is the Horizontal Axis.
-        if dx_01 > dy_01:
-            print("  - Detected: Stage X corresponds to Image Horizontal (Row-Major filling).")
-            # H step is driven by X, V step is driven by Y
-            h_stage_vals = [c[0] for c in coords]
-            v_stage_vals = [c[1] for c in coords]
-        else:
-            print("  - Detected: Stage Y corresponds to Image Horizontal (Row-Major filling).")
-            # H step is driven by Y, V step is driven by X
-            h_stage_vals = [c[1] for c in coords]
-            v_stage_vals = [c[0] for c in coords]
+    step_y_nm = mosaic.get('UserOffsetY')
+    if not step_y_nm:
+        unique_y = sorted(list(set(c[1] for c in coords)))
+        step_y_nm = unique_y[1] - unique_y[0] if len(unique_y) > 1 else 1
 
-        # 3. Calculate Average Steps (Delta) in Stage Units
-        # We find unique values to determine grid dimensions and average step
+    tile_data = []
+    for i, (cx, cy) in enumerate(coords):
+        # Calculate Row and Col mapping
+        col = int(round((max_x - cx) / step_x_nm))
+        row = int(round((max_y - cy) / step_y_nm))
         
-        # Rounding to nearest 100 units to group slightly jittered positions
-        unique_h = sorted(list(set([round(v, -2) for v in h_stage_vals])))
-        unique_v = sorted(list(set([round(v, -2) for v in v_stage_vals])))
+        # Calculate ABS_H and ABS_V strictly from physical nm converted to pixels
+        abs_h = (max_x - cx) * 1e-3 / params['voxel_H']
+        abs_v = (max_y - cy) * 1e-3 / params['voxel_V']
         
-        grid_width = len(unique_h) # Number of columns
-        grid_height = len(unique_v) # Number of rows
-        
-        print(f"  - Grid Dimensions Detected: {grid_width} Cols x {grid_height} Rows")
+        tile_data.append({
+            'index': i,
+            'row': row,
+            'col': col,
+            'abs_h': int(round(abs_h)),
+            'abs_v': int(round(abs_v))
+        })
 
-        # Calculate H Step (Horizontal)
-        if grid_width > 1:
-            steps_h = [abs(unique_h[i+1] - unique_h[i]) for i in range(len(unique_h)-1)]
-            avg_step_stage_h = sum(steps_h) / len(steps_h)
-        else:
-            avg_step_stage_h = 0
-            
-        # Calculate V Step (Vertical)
-        if grid_height > 1:
-            steps_v = [abs(unique_v[i+1] - unique_v[i]) for i in range(len(unique_v)-1)]
-            avg_step_stage_v = sum(steps_v) / len(steps_v)
-        else:
-            avg_step_stage_v = 0
-            
-        # 4. Convert Stage Units to Pixels
-        # Assumption: Stage units are Nanometers (1e-3 microns). 
-        # Verification: Typical step is ~2.6e6. 2.6e6 * 1e-3 = 2660um. FOV is ~2900um. Matches.
-        
-        step_microns_h = avg_step_stage_h * 1e-3
-        step_microns_v = avg_step_stage_v * 1e-3
-        
-        step_pixels_h = step_microns_h / voxel_size_h
-        step_pixels_v = step_microns_v / voxel_size_v
-        
-        # Fallback if single row/col
-        if step_pixels_h == 0: step_pixels_h = 2048 * 0.9 # Default 10% overlap
-        if step_pixels_v == 0: step_pixels_v = 2048 * 0.9
+    grid_w = mosaic.get('xTileNumber', max(t['col'] for t in tile_data) + 1)
+    grid_h = mosaic.get('yTileNumber', max(t['row'] for t in tile_data) + 1)
 
-        print(f"  - Calculated Step H: {step_pixels_h:.2f} pixels ({step_microns_h:.2f} um)")
-        print(f"  - Calculated Step V: {step_pixels_v:.2f} pixels ({step_microns_v:.2f} um)")
-        
-        return step_pixels_h, step_pixels_v, grid_width, grid_height
+    mech_disp_H_microns = step_x_nm * 1e-3
+    mech_disp_V_microns = step_y_nm * 1e-3
 
-    except Exception as e:
-        print(f"  - Error during coordinate calculation: {e}")
-        print("  - Fallback: Using default theoretical overlap (10%).")
-        return 2048*0.9, 2048*0.9, 5, 5 # Fallback defaults
+    return tile_data, grid_w, grid_h, mech_disp_H_microns, mech_disp_V_microns
 
 
 def parse_metadata(cbf_path, ome_path):
-    """Parses metadata files to extract experiment parameters."""
     params = {}
     print("Parsing metadata...")
-    try:
-        with open(cbf_path, 'r', encoding='utf-8') as f:
-            cbf_data = json.load(f)
-        
-        # Get Image Dimensions (assume 2048 if missing, as legacy 240 is definitely wrong)
-        # Note: 'IMAGE WIDTH' is inside the 'Settings' list or 'PresetChannel', searching recursively is safer,
-        # but for this specific file structure we check the first available camera setting.
-        try:
-             # Basic fallback
-            img_width = 2048 
-            img_height = 2048
-            # Try to find in cameras
-            for cam in cbf_data.get('ROIs', {}).get('PresetChannel', []):
-                 for dev in cam.get('devices', []):
-                     if dev.get('Id', {}).get('SubDeviceId') == 'IMAGE WIDTH':
-                         img_width = int(dev['Value'])
-                     if dev.get('Id', {}).get('SubDeviceId') == 'IMAGE HEIGHT':
-                         img_height = int(dev['Value'])
-        except:
-            img_width = 2048
-            img_height = 2048
-
-        params['img_width_px'] = img_width
-        params['img_height_px'] = img_height
-        
-        # Calculate Steps in Pixels
-        step_h_px, step_v_px, grid_w, grid_h = calculate_steps_from_coordinates(
-            cbf_data, VOXEL_SIZE_OVERRIDE["H"], VOXEL_SIZE_OVERRIDE["V"]
-        )
-
-        params['step_H_px'] = floor(step_h_px)
-        params['step_V_px'] = floor(step_v_px)
-        params['gridH'] = grid_w
-        params['gridV'] = grid_h
-
-        # Calculate estimated overlap for report
-        ov_h = 1.0 - (step_h_px / img_width)
-        print(f"  - Effective Overlap H: {ov_h*100:.2f}%")
-        
-    except Exception as e:
-        print(f"Error parsing CBF file '{cbf_path}': {e}")
-        return None
-
+    
+    # 1. Get dimensions from OME, but rigidly lock XY voxel sizes to fallback
     try:
         tree = ET.parse(ome_path)
         root = tree.getroot()
         ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
         pixels_node = root.find('ome:Image/ome:Pixels', ns)
-        if pixels_node is None: raise ValueError("Pixels node not found in OME-XML.")
         
-        params.update({
-            'no_slices_metadata': int(pixels_node.get('SizeZ'))
-        })
+        def get_dim(attr, fallback):
+            val = pixels_node.get(attr)
+            if val is None: return fallback
+            unit = pixels_node.get(attr + 'Unit', 'um')
+            return float(val) * 1e-3 if unit == 'nm' else float(val)
+
+        # FORCE the empirically true 1.44 value for XY to avoid offset inflation from bad OME data
+        params['voxel_H'] = VOXEL_SIZE_FALLBACK["H"]
+        params['voxel_V'] = VOXEL_SIZE_FALLBACK["V"]
+        params['z_spacing'] = get_dim('PhysicalSizeZ', VOXEL_SIZE_FALLBACK["D"])
+        params['no_slices_metadata'] = int(pixels_node.get('SizeZ'))
+        params['img_width_px'] = int(pixels_node.get('SizeX'))
+        params['img_height_px'] = int(pixels_node.get('SizeY'))
     except Exception as e:
-        print(f"Error parsing OME-XML file '{ome_path}': {e}")
+        print(f"Error parsing OME: {e}")
         return None
 
-    params['voxel_H'] = VOXEL_SIZE_OVERRIDE["H"]
-    params['voxel_V'] = VOXEL_SIZE_OVERRIDE["V"]
-    params['z_spacing'] = VOXEL_SIZE_OVERRIDE["D"]
+    # 2. Extract exact coordinates using CBF
+    try:
+        with open(cbf_path, 'r', encoding='utf-8') as f:
+            cbf_data = json.load(f)
+            
+        extracted = extract_positions_from_cbf(cbf_data, params)
+        if not extracted:
+            print("Error: Could not extract mosaic positions from CBF.")
+            return None
+            
+        tile_data, grid_w, grid_h, mech_H, mech_V = extracted
+        
+        params.update({
+            'tile_data': tile_data,
+            'gridH': grid_w, 
+            'gridV': grid_h,
+            'mech_disp_H_microns': mech_H,
+            'mech_disp_V_microns': mech_V
+        })
+        
+        print(f"  - Detected Voxel Size: {params['voxel_H']:.3f} um (Forced override)")
+        print(f"  - Extracted {len(tile_data)} exact tile positions from stage coordinates.")
+        
+    except Exception as e:
+        print(f"Error parsing CBF: {e}")
+        return None
     
     return params
+    
+def get_channel_descriptions(ome_path):
+    """Parses OME XML to return a dictionary of channel ID -> descriptive string."""
+    descriptions = {}
+    try:
+        tree = ET.parse(ome_path)
+        root = tree.getroot()
+        ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
+        
+        for channel in root.findall(".//ome:Channel", ns):
+            full_id = channel.get('ID', '0:0')
+            c_id = full_id.split(':')[-1] 
+            
+            if c_id not in descriptions:
+                name = channel.get('Name', 'Unknown')
+                ex = channel.get('ExcitationWavelength', '?')
+                em = channel.get('EmissionWavelength', '?')
+                descriptions[c_id] = f"{name}nm | Ex: {ex}nm / Em: {em}nm"
 
+        processed_params = set()
+        for map_ann in root.findall(".//ome:MapAnnotation", ns):
+            ann_id = map_ann.get('ID', '')
+            if 'ChannelParameters' in ann_id and ann_id not in processed_params:
+                c_idx = ann_id.replace('ChannelParameters', '')
+                if c_idx in descriptions:
+                    values = {m.get('K'): m.text for m in map_ann.findall(".//ome:M", ns)}
+                    power = next((v for k, v in values.items() if 'Power (%)' in k), "N/A")
+                    filt = values.get('Emission_FW-Filters', "N/A")
+                    descriptions[c_idx] = f"{descriptions[c_idx]} | Power: {power}% | Filter: {filt}"
+                    processed_params.add(ann_id)
+                    
+    except Exception as e:
+        print(f"Warning: Could not parse channel details: {e}")
+    return descriptions
+    
 
 def get_available_channels(data_folder, params):
     """Scans the folder to detect which channels (c0, c1...) are present."""
     channels = set()
     pattern = re.compile(r"_c(\d+)_z")
-    # Check first few tiles
     tiles_to_check = min(5, params['gridH'] * params['gridV'])
     
     for i in range(tiles_to_check):
@@ -274,16 +253,7 @@ def generate_terastitcher_xml(output_path, params, data_folder, channel_idx, sli
     """Generates the TeraStitcher import XML."""
     print(f"Generating XML for Channel {channel_idx} -> {os.path.basename(output_path)}")
 
-    # --- CORRECTION START ---
-    # Mechanical displacements in the XML Header must be in MICRONS (Physical Units)
-    # because voxel_dims are defined in microns.
-    # We multiply the pixel step by the voxel size.
-    mech_disp_H_microns = params['step_H_px'] * params['voxel_H']
-    mech_disp_V_microns = params['step_V_px'] * params['voxel_V']
-    # --- CORRECTION END ---
-    
-    # Dimensions in microns
-    vxl_V = params['voxel_H']
+    vxl_V = params['voxel_V']
     vxl_H = params['voxel_H']
     vxl_D = params['z_spacing']
 
@@ -294,16 +264,12 @@ def generate_terastitcher_xml(output_path, params, data_folder, channel_idx, sli
     terastitcher_node.set('input_plugin', 'tiff2D')
 
     ET.SubElement(terastitcher_node, 'stacks_dir', value=str(data_folder))
+    # NOTE: Each channel MUST have its own metadata bin file
     ET.SubElement(terastitcher_node, 'mdata_bin', value=os.path.join(data_folder, f'mdata_c{channel_idx}.bin'))
-    
-    # Reference system: 1=V(Y), 2=H(X), 3=D(Z).
     ET.SubElement(terastitcher_node, 'ref_sys', ref1="1", ref2="2", ref3="3")
-    
     ET.SubElement(terastitcher_node, 'voxel_dims', V=str(vxl_V), H=str(vxl_H), D=str(vxl_D))
     ET.SubElement(terastitcher_node, 'origin', V="0", H="0", D="0")
-    
-    # --- UPDATED LINE BELOW ---
-    ET.SubElement(terastitcher_node, 'mechanical_displacements', V=str(mech_disp_V_microns), H=str(mech_disp_H_microns))
+    ET.SubElement(terastitcher_node, 'mechanical_displacements', V=str(params['mech_disp_V_microns']), H=str(params['mech_disp_H_microns']))
     
     ET.SubElement(terastitcher_node, 'dimensions',
                stack_rows=str(params['gridV']),
@@ -312,33 +278,28 @@ def generate_terastitcher_xml(output_path, params, data_folder, channel_idx, sli
 
     stacks_node = ET.SubElement(terastitcher_node, 'STACKS')
     
-    for row in range(params['gridV']):
-        for col in range(params['gridH']):
-            
-            # NOTE: ABS_V and ABS_H inside the Stack elements MUST remain in PIXELS.
-            # TeraStitcher expects raw coordinates here.
-            abs_H_eff = col * params['step_H_px']
-            abs_V_eff = row * params['step_V_px']
-            
-            folder_index = row * params['gridH'] + col
-            dir_name = TILE_FOLDER_FORMAT.format(index=folder_index)
-            
-            stack_attribs = {
-                'N_CHANS': "1",
-                'N_BYTESxCHAN': "2",
-                'ROW': str(row), 'COL': str(col), 
-                'ABS_V': str(abs_V_eff),
-                'ABS_H': str(abs_H_eff), 
-                'ABS_D': "0", 
-                'STITCHABLE': "no",
-                'DIR_NAME': dir_name, 
-                'IMG_REGEX': channel_regex, 
-                'Z_RANGES': f"[{0},{slice_count})"
-            }
-            stack_node = ET.SubElement(stacks_node, 'Stack', **stack_attribs)
-            
-            for direction in ['NORTH', 'EAST', 'SOUTH', 'WEST']:
-                ET.SubElement(stack_node, f'{direction}_displacements')
+    # Sort tiles to ensure TeraStitcher establishes the correct global bounding box
+    sorted_tiles = sorted(params['tile_data'], key=lambda t: (t['row'], t['col']))
+    
+    for tile in sorted_tiles:
+        dir_name = TILE_FOLDER_FORMAT.format(index=tile['index'])
+        
+        stack_attribs = {
+            'N_CHANS': "1",
+            'N_BYTESxCHAN': "2",
+            'ROW': str(tile['row']), 'COL': str(tile['col']), 
+            'ABS_V': str(tile['abs_v']),
+            'ABS_H': str(tile['abs_h']), 
+            'ABS_D': "0", 
+            'STITCHABLE': "no",
+            'DIR_NAME': dir_name, 
+            'IMG_REGEX': channel_regex, 
+            'Z_RANGES': f"[{0},{slice_count})"
+        }
+        stack_node = ET.SubElement(stacks_node, 'Stack', **stack_attribs)
+        
+        for direction in ['NORTH', 'EAST', 'SOUTH', 'WEST']:
+            ET.SubElement(stack_node, f'{direction}_displacements')
 
     xml_string = ET.tostring(terastitcher_node, 'utf-8')
     reparsed = minidom.parseString(xml_string)
@@ -347,72 +308,171 @@ def generate_terastitcher_xml(output_path, params, data_folder, channel_idx, sli
     with open(output_path, 'wb') as f:
         f.write(pretty_xml)
 
-def generate_execution_script(output_folder, xml_import_file, channel_idx):
-    """Generates a dedicated execution script for a specific channel."""
+def create_propagation_script(output_folder, main_channel_idx, available_channels):
+    """
+    Creates a Python script that CLONES the aligned reference XML and 
+    PATCHES it for all other channels (updating mdata path and regex).
+    This ensures all channels share the exact same grid topology.
+    """
+    script_path = os.path.join(output_folder, "propagate_xmls.py")
+    
+    content = f"""
+import xml.etree.ElementTree as ET
+import os
+import sys
+
+# AUTO-GENERATED SCRIPT to propagate TeraStitcher alignments
+MAIN_CHANNEL = {main_channel_idx}
+CHANNELS = {available_channels}
+
+def main():
+    print("--- Running XML Propagation Step ---")
+    # This is the file produced by the alignment steps on the MAIN channel
+    aligned_xml = f"xml_merging_c{{MAIN_CHANNEL}}.xml"
+    
+    if not os.path.exists(aligned_xml):
+        print(f"Error: Aligned file {{aligned_xml}} not found! Alignment failed?")
+        sys.exit(1)
+        
+    print(f"Cloning alignment from reference: {{aligned_xml}}")
+    
+    # Iterate over all OTHER channels
+    for c_idx in CHANNELS:
+        if c_idx == MAIN_CHANNEL:
+            continue
+            
+        target_xml = f"xml_merging_c{{c_idx}}.xml"
+        
+        try:
+            tree = ET.parse(aligned_xml)
+            root = tree.getroot()
+            
+            # 1. Update mdata_bin path
+            # Look for <mdata_bin value="...">
+            mdata_node = root.find("mdata_bin")
+            if mdata_node is not None:
+                old_val = mdata_node.get("value")
+                new_val = old_val.replace(f"mdata_c{{MAIN_CHANNEL}}.bin", f"mdata_c{{c_idx}}.bin")
+                mdata_node.set("value", new_val)
+                
+            # 2. Update IMG_REGEX in every Stack
+            # Look for IMG_REGEX="_c0_z" -> replace with "_c1_z"
+            old_regex_part = f"_c{{MAIN_CHANNEL}}_z"
+            new_regex_part = f"_c{{c_idx}}_z"
+            
+            stacks = root.findall(".//Stack")
+            print(f"  -> Generating {{target_xml}} (Updating {{len(stacks)}} stacks)...")
+            
+            for stack in stacks:
+                regex = stack.get("IMG_REGEX")
+                if regex and old_regex_part in regex:
+                    stack.set("IMG_REGEX", regex.replace(old_regex_part, new_regex_part))
+                
+                # Also ensure STITCHABLE is 'no' (it should be 'no' in merging XML anyway, but good safety)
+                stack.set("STITCHABLE", "no")
+
+            tree.write(target_xml)
+            print(f"     [OK] Saved {{target_xml}}")
+            
+        except Exception as e:
+            print(f"Error processing channel {{c_idx}}: {{e}}")
+            sys.exit(1)
+
+    print("Propagation complete.")
+
+if __name__ == "__main__":
+    main()
+"""
+    with open(script_path, 'w') as f:
+        f.write(content)
+        
+def generate_execution_script(output_folder, available_channels, main_channel_idx):
+    """Generates the batch script following the official MultiChannel alignment workflow."""
     is_windows = sys.platform.startswith('win')
-    script_filename = f"run_stitching_c{channel_idx}.{'bat' if is_windows else 'sh'}"
+    script_filename = f"run_stitching_multi.{'bat' if is_windows else 'sh'}"
     script_path = os.path.join(output_folder, script_filename)
     
-    suffix = f"_c{channel_idx}"
-    proj_displcomp = f"xml_displcomp{suffix}.xml"
-    proj_displproj = f"xml_displproj{suffix}.xml"
-    proj_displthres = f"xml_displthres{suffix}.xml"
-    proj_merging = f"xml_merging{suffix}.xml"
-    stitched_folder = os.path.join(output_folder, f"Stitched_c{channel_idx}")
+    main_import_xml = f"terastitcher_import_c{main_channel_idx}.xml"
+    main_merging_xml = f"xml_merging_c{main_channel_idx}.xml"
     
-    terastitcher_cmd = "terastitcher"
-    comment_char = "REM" if is_windows else "#"
+    # Params from Global Dict
+    imout_depth = DEFAULT_STITCHING_PARAMS["imout_depth"]
+    subvoldim = DEFAULT_STITCHING_PARAMS["subvoldim"]
+    sV = DEFAULT_STITCHING_PARAMS["sV"]
+    sH = DEFAULT_STITCHING_PARAMS["sH"]
+    sD = DEFAULT_STITCHING_PARAMS["sD"]
+    thres = DEFAULT_STITCHING_PARAMS["displ_threshold"]
+    
+    lines = []
+    
+    lines.append("@echo off")
+    lines.append(f"echo --- Phase 1: Generating Test Projections for ALL channels ---")
+    
+    # 1. Test Projections Loop
+    for c in available_channels:
+        lines.append(f"echo Generating test image for Channel {c}...")
+        # Run test generation
+        lines.append(f'terastitcher --test --projin="terastitcher_import_c{c}.xml" --imout_depth={imout_depth} --sparse_data')
+        
+        # Rename the output to avoid overwriting. 
+        # TeraStitcher default output for --test is usually 'test_middle_slice.tif'
+        lines.append(f'if exist "test_middle_slice.tif" ren "test_middle_slice.tif" "test_c{c}.tif"')
+    
+    # 2. User Confirmation
+    lines.append(f"echo.")
+    lines.append(f"echo ----------------------------------------------------------------")
+    lines.append(f"echo Please check the generated 'test_cX.tif' images in the folder.")
+    lines.append(f"echo ----------------------------------------------------------------")
+    lines.append('SET /P continue="Are the projections correct (y/n)? "')
+    lines.append('IF /I "%continue%" NEQ "y" EXIT /B 1')
+    
+    # 3. Alignment (Main Channel Only)
+    lines.append(f"echo.")
+    lines.append(f"echo --- Phase 2: Aligning Reference Channel {main_channel_idx} ---")
+    lines.append(f'terastitcher --displcompute --projin="{main_import_xml}" --projout="xml_comp.xml" --subvoldim={subvoldim} --sV={sV} --sH={sH} --sD={sD} --sparse_data')
+    lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
+    
+    lines.append(f'terastitcher --displproj --projin="xml_comp.xml" --projout="xml_proj.xml" --sparse_data')
+    lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
+    
+    lines.append(f'terastitcher --displthres --projin="xml_proj.xml" --projout="xml_thres.xml" --threshold={thres} --sparse_data')
+    lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
+    
+    lines.append(f'terastitcher --placetiles --projin="xml_thres.xml" --projout="{main_merging_xml}" --sparse_data')
+    lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
 
-    lines = ["@echo off"] if is_windows else ["#!/bin/bash", "set -e"]
-    lines.extend([
-        "",
-        f"{comment_char} TeraStitcher Pipeline for CHANNEL {channel_idx}",
-        f"{comment_char} 1. Test import.",
-        f'{terastitcher_cmd} --test --projin="{xml_import_file}" --imout_depth={DEFAULT_STITCHING_PARAMS["imout_depth"]} --sparse_data',
-        ""
-    ])
-    
-    if is_windows:
-        lines.extend([
-            'SET /P continue="Is the projection correct (y/n)?"',
-            'IF NOT %continue% == y EXIT /B 1'
-        ])
-    else:
-        lines.extend([
-            'read -p "Is the projection correct (y/n)? " continue',
-            'if [[ ! "$continue" =~ ^[Yy]$ ]]; then exit 1; fi'
-        ])
-    
-    lines.extend([
-        "",
-        f"{comment_char} 2. Compute displacements",
-        f'{terastitcher_cmd} --displcompute --projin="{xml_import_file}" --projout="{proj_displcomp}" --subvoldim={DEFAULT_STITCHING_PARAMS["subvoldim"]} --sV={DEFAULT_STITCHING_PARAMS["sV"]} --sH={DEFAULT_STITCHING_PARAMS["sH"]} --sD={DEFAULT_STITCHING_PARAMS["sD"]} --sparse_data',
-        "",
-        f"{comment_char} 3. Project displacements",
-        f'{terastitcher_cmd} --displproj --projin="{proj_displcomp}" --projout="{proj_displproj}" --sparse_data',
-        "",
-        f"{comment_char} 4. Threshold displacements",
-        f'{terastitcher_cmd} --displthres --projin="{proj_displproj}" --projout="{proj_displthres}" --threshold={DEFAULT_STITCHING_PARAMS["displ_threshold"]} --sparse_data',
-        "",
-        f"{comment_char} 5. Place tiles",
-        f'{terastitcher_cmd} --placetiles --projin="{proj_displthres}" --projout="{proj_merging}" --sparse_data',
-        "",
-        f"{comment_char} 6. Merge tiles into final volume",
-        f'mkdir "{stitched_folder}"',
-        f'{terastitcher_cmd} --merge --projin="{proj_merging}" --volout="{stitched_folder}" --resolutions=024 --imout_depth={DEFAULT_STITCHING_PARAMS["imout_depth"]} --sparse_data',
-        "",
-        f"echo Stitching for Channel {channel_idx} complete!"
-    ])
+    # 4. Propagation
+    lines.append("\n" + f"echo --- Phase 3: Propagating Alignment to Satellite Channels ---")
+    lines.append(f'{sys.executable} propagate_xmls.py')
+    lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
+
+    # 5. Independent Merge
+    lines.append("\n" + f"echo --- Phase 4: Merging Channels Independently ---")
+    for c_idx in available_channels:
+        input_xml = f"xml_merging_c{c_idx}.xml"
+        output_dir = f"Stitched_c{c_idx}"
+        lines.append(f'echo Merging Channel {c_idx}...')
+        lines.append(f'if not exist "{output_dir}" mkdir "{output_dir}"')
+        lines.append(f'terastitcher --merge --projin="{input_xml}" --volout="{output_dir}" --resolutions=024 --imout_depth={imout_depth} --sparse_data')
+        lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
+
+    lines.append("\necho Stitching Completed Successfully!")
+    lines.append("PAUSE")
+    lines.append("EXIT /B 0")
+
+    lines.append("\n:ERROR")
+    lines.append("echo Pipeline failed.")
+    lines.append("PAUSE")
+    lines.append("EXIT /B 1")
 
     with open(script_path, 'w', newline='\r\n' if is_windows else '\n') as f:
         f.write("\n".join(lines))
-        
-    if not is_windows: os.chmod(script_path, 0o755)
-
-
+    
+    if not is_windows:
+        os.chmod(script_path, 0o755)
+         
 def check_and_rename_files(data_folder):
     """Renames files to ensure zero-padding."""
-    print("\n--- Checking for filename sorting issues ---")
     rename_pattern = re.compile(r"(_c\d+_z)(\d+)(\.ome\.tif)$")
     files_to_process = []
     max_z_number = 0
@@ -434,16 +494,12 @@ def check_and_rename_files(data_folder):
                     "suffix": suffix
                 })
 
-    if not files_to_process:
-        print("No image files found matching pattern.")
-        return True
+    if not files_to_process: return True
 
     padding_width = max(4, len(str(max_z_number)))
     files_to_rename = [f for f in files_to_process if len(f['number_str']) < padding_width]
 
-    if not files_to_rename:
-        print("✅ All filenames are correctly padded.")
-        return True
+    if not files_to_rename: return True
 
     print(f"\n⚠️ WARNING: Found {len(files_to_rename)} files to rename (Padding to {padding_width} digits).")
     try:
@@ -451,40 +507,31 @@ def check_and_rename_files(data_folder):
     except EOFError:
         user_input = 'n'
 
-    if user_input != 'y':
-        print("Renaming cancelled.")
-        return False
+    if user_input != 'y': return False
 
     print("Renaming files...")
-    count = 0
     for f in files_to_rename:
         new_number_str = f['number_str'].zfill(padding_width)
         new_filename = f"{f['prefix']}{new_number_str}{f['suffix']}"
-        old_path = f['path']
-        new_path = os.path.join(f['dir'], new_filename)
         try:
-            os.rename(old_path, new_path)
-            count += 1
+            os.rename(f['path'], os.path.join(f['dir'], new_filename))
         except OSError:
             pass
-    print(f"Successfully renamed {count} files.")
     return True
-
 
 def main():
     root = Tk()
     root.withdraw()
     selected_folder = filedialog.askdirectory(title="Select the ROOT folder of your experiment")
 
-    if not selected_folder:
-        print("No folder selected. Exiting.")
-        return
+    if not selected_folder: return
 
     print(f"Selected data folder: {selected_folder}")
 
-    cbf_file = find_file_by_suffix(selected_folder, CBF_METADATA_FILENAME)
+    cbf_file        = find_file_by_suffix(selected_folder, CBF_METADATA_FILENAME)
     raw_data_folder = os.path.join(selected_folder, "images", "RAW_DATA")
-    ome_file = os.path.join(raw_data_folder, OME_METADATA_FILENAME)
+    ome_file        = os.path.join(raw_data_folder, OME_METADATA_FILENAME)
+    channel_details = get_channel_descriptions(ome_file)
     
     check_and_rename_files(raw_data_folder)
 
@@ -496,7 +543,10 @@ def main():
     if not params: return
 
     available_channels = get_available_channels(raw_data_folder, params)
-    print(f"\n--- Detected Channels: {available_channels} ---")
+    print("\n--- Available Channels Detected ---")
+    for c_id in sorted(available_channels):
+        info = channel_details.get(str(c_id), "No metadata found")
+        print(f"[{c_id}]: {info}")
     
     selected_channel = None
     if len(available_channels) == 1:
@@ -505,30 +555,38 @@ def main():
     else:
         while True:
             try:
-                user_input = input(f"Enter the channel number to stitch {available_channels}: ")
+                user_input = input(f"Enter the MAIN channel for alignment {available_channels}: ")
                 selection = int(user_input)
                 if selection in available_channels:
                     selected_channel = selection
                     break
                 else:
-                    print(f"Invalid selection. Please choose from {available_channels}")
+                    print("Invalid selection.")
             except ValueError:
-                print("Invalid input. Please enter a number.")
+                pass
     
-    print(f"\n--- Processing Channel {selected_channel} ---")
-    slice_count = verify_slice_counts(raw_data_folder, params, selected_channel)
-    if slice_count > 0:
-        xml_output_filename = f"terastitcher_import_c{selected_channel}.xml"
-        xml_output_path = os.path.join(raw_data_folder, xml_output_filename)
-        
-        generate_terastitcher_xml(xml_output_path, params, raw_data_folder, selected_channel, slice_count)
-        generate_execution_script(raw_data_folder, xml_output_filename, selected_channel)
-        
-        print("\nProcess finished successfully!")
-        if sys.platform.startswith('win'):
-            print(f"Run 'run_stitching_c{selected_channel}.bat' to stitch.")
-        else:
-            print(f"Run './run_stitching_c{selected_channel}.sh' to stitch.")
+    print(f"\n--- Generating Files for Main Channel {selected_channel} and Satellites ---")
+    
+    # 1. Generate Import XMLs for ALL channels
+    for c_idx in available_channels:
+        slice_count = verify_slice_counts(raw_data_folder, params, c_idx)
+        xml_path = os.path.join(raw_data_folder, f"terastitcher_import_c{c_idx}.xml")
+        generate_terastitcher_xml(xml_path, params, raw_data_folder, c_idx, slice_count)
+
+    # 2. Generate the Coordinate Updater Script
+    create_propagation_script(raw_data_folder, selected_channel, available_channels)
+
+    # 4. Generate Execution Script
+    generate_execution_script(
+        raw_data_folder, 
+        available_channels, 
+        selected_channel)
+
+    print("\nProcess finished successfully!")
+    if sys.platform.startswith('win'):
+        print(f"Run 'run_stitching_multi.bat' inside the RAW_DATA folder.")
+    else:
+        print(f"Run './run_stitching_multi.sh' inside the RAW_DATA folder.")
 
 if __name__ == '__main__':
     main()
