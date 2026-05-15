@@ -4,13 +4,13 @@ This script automatically generates a TeraStitcher XML descriptor and execution
 script for MULTI-CHANNEL datasets using exact stage coordinates from CBF metadata.
 
 Supports TWO folder structures:
-  A) Single experiment:  root/ has one .cbf and images/RAW_DATA/ with channels c0, c1, …
+  A) Single experiment:  root/ has one .cbf and images/RAW_DATA/ with channels c0, c1, ...
   B) Split-channel:      root/ has sub-folders, each with its own .cbf and images/RAW_DATA/
      Each sub-folder is ONE channel (files always use c0).  User picks the reference
      folder for alignment; the computed stitching is applied to every other folder.
 
 Author: DK & Gemini
-Date: January 08, 2026 — Extended May 2026
+Date: January 08, 2026 -- Extended May 2026
 """
 import os
 import sys
@@ -390,7 +390,7 @@ def main():
 if __name__ == "__main__":
     main()
 """
-    with open(script_path, 'w') as f:
+    with open(script_path, 'w', encoding='utf-8') as f:
         f.write(content)
         
 def generate_execution_script(output_folder, available_channels, main_channel_idx):
@@ -508,7 +508,7 @@ def check_and_rename_files(data_folder):
 
     if not files_to_rename: return True
 
-    print(f"\n⚠️ WARNING: Found {len(files_to_rename)} files to rename (Padding to {padding_width} digits).")
+    print(f"\nWARNING: WARNING: Found {len(files_to_rename)} files to rename (Padding to {padding_width} digits).")
     try:
         user_input = input("Proceed with renaming? (y/n): ").lower()
     except EOFError:
@@ -536,7 +536,7 @@ def discover_experiments(root_folder):
     Detects folder structure.
 
     Returns a list of experiment dicts:
-        cbf_path, raw_data_folder, ome_path, subfolder_name (None → single)
+        cbf_path, raw_data_folder, ome_path, subfolder_name (None -> single)
     """
     # Case A: root itself is the experiment
     cbf = find_file_by_suffix(root_folder, CBF_METADATA_FILENAME)
@@ -574,11 +574,11 @@ def create_propagation_script_multi(output_folder, ref_name, folder_names, raw_d
     Multi-folder propagation: clones the aligned reference XML and patches
     stacks_dir + mdata_bin to point at each satellite folder's RAW_DATA.
     IMG_REGEX is left untouched (all folders use c0).
-    DIR_NAME is left untouched (all folders use image_xy0, image_xy1, …).
+    DIR_NAME is left untouched (all folders use image_xy0, image_xy1, ...).
     """
     script_path = os.path.join(output_folder, "propagate_xmls.py")
 
-    # Build a Python dict literal mapping folder name → RAW_DATA absolute path
+    # Build a Python dict literal mapping folder name -> RAW_DATA absolute path
     path_map_str = "{\n"
     for name in folder_names:
         path_map_str += f"    {repr(name)}: {repr(raw_data_paths[name])},\n"
@@ -590,7 +590,7 @@ import os
 import sys
 
 # AUTO-GENERATED SCRIPT to propagate TeraStitcher alignments (multi-folder mode)
-# Each folder is one channel — all use c0 internally.  We only swap paths.
+# Each folder is one channel -- all use c0 internally.  We only swap paths.
 REF_FOLDER = {repr(ref_name)}
 FOLDER_NAMES = {repr(folder_names)}
 RAW_DATA_PATHS = {path_map_str}
@@ -618,7 +618,7 @@ def main():
             tree = ET.parse(aligned_xml)
             root = tree.getroot()
 
-            # 1. Swap stacks_dir → satellite folder's RAW_DATA
+            # 1. Swap stacks_dir -> satellite folder's RAW_DATA
             stacks_node = root.find("stacks_dir")
             if stacks_node is not None:
                 stacks_node.set("value", sat_raw)
@@ -648,7 +648,7 @@ def main():
 if __name__ == "__main__":
     main()
 """
-    with open(script_path, 'w') as f:
+    with open(script_path, 'w', encoding='utf-8') as f:
         f.write(content)
 
 
@@ -822,7 +822,7 @@ def run_multi_experiment(selected_folder, experiments):
 
 
 # ==========================================================================
-#  MAIN — auto-detects single vs multi and dispatches accordingly
+#  MAIN -- auto-detects single vs multi and dispatches accordingly
 # ==========================================================================
 
 def main():
