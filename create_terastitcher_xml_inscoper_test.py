@@ -596,6 +596,8 @@ FOLDER_NAMES = {repr(folder_names)}
 RAW_DATA_PATHS = {path_map_str}
 
 def main():
+    # Ensure we run from the script's own directory
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("--- Running XML Propagation Step (multi-folder) ---")
     aligned_xml = f"xml_merging_{{REF_FOLDER}}.xml"
 
@@ -675,13 +677,19 @@ def generate_execution_script_multi(output_folder, folder_names, ref_name):
     lines = []
 
     lines.append("@echo off")
+    lines.append('cd /d "%~dp0"')
     lines.append("echo --- Phase 1: Generating Test Projections for ALL folders ---")
+
+    # Use %~dp0 (bat file's directory with trailing backslash) to build absolute
+    # paths for every XML.  TeraStitcher may write --projout relative to stacks_dir
+    # instead of CWD, so relative filenames break in multi-folder mode.
+    BD = "%~dp0"   # batch-dir placeholder used in the generated strings
 
     # 1. Test projections for every folder
     for name in folder_names:
         lines.append(f"echo Generating test image for [{name}]...")
-        lines.append(f'terastitcher --test --projin="terastitcher_import_{name}.xml" --imout_depth={imout_depth} --sparse_data')
-        lines.append(f'if exist "test_middle_slice.tif" ren "test_middle_slice.tif" "test_{name}.tif"')
+        lines.append(f'terastitcher --test --projin="{BD}terastitcher_import_{name}.xml" --imout_depth={imout_depth} --sparse_data')
+        lines.append(f'if exist "test_middle_slice.tif" ren "test_middle_slice.tif" "{BD}test_{name}.tif"')
 
     # 2. User confirmation
     lines.append("echo.")
@@ -694,21 +702,21 @@ def generate_execution_script_multi(output_folder, folder_names, ref_name):
     # 3. Alignment on reference folder only
     lines.append("echo.")
     lines.append(f"echo --- Phase 2: Aligning Reference Folder [{ref_name}] ---")
-    lines.append(f'terastitcher --displcompute --projin="{ref_import_xml}" --projout="xml_comp.xml" --subvoldim={subvoldim} --sV={sV} --sH={sH} --sD={sD} --sparse_data')
+    lines.append(f'terastitcher --displcompute --projin="{BD}{ref_import_xml}" --projout="{BD}xml_comp.xml" --subvoldim={subvoldim} --sV={sV} --sH={sH} --sD={sD} --sparse_data')
     lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
 
-    lines.append(f'terastitcher --displproj --projin="xml_comp.xml" --projout="xml_proj.xml" --sparse_data')
+    lines.append(f'terastitcher --displproj --projin="{BD}xml_comp.xml" --projout="{BD}xml_proj.xml" --sparse_data')
     lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
 
-    lines.append(f'terastitcher --displthres --projin="xml_proj.xml" --projout="xml_thres.xml" --threshold={thres} --sparse_data')
+    lines.append(f'terastitcher --displthres --projin="{BD}xml_proj.xml" --projout="{BD}xml_thres.xml" --threshold={thres} --sparse_data')
     lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
 
-    lines.append(f'terastitcher --placetiles --projin="xml_thres.xml" --projout="{ref_merging_xml}" --sparse_data')
+    lines.append(f'terastitcher --placetiles --projin="{BD}xml_thres.xml" --projout="{BD}{ref_merging_xml}" --sparse_data')
     lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
 
     # 4. Propagation to satellite folders
     lines.append("\n" + "echo --- Phase 3: Propagating Alignment to Satellite Folders ---")
-    lines.append(f'{sys.executable} propagate_xmls.py')
+    lines.append(f'{sys.executable} "{BD}propagate_xmls.py"')
     lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
 
     # 5. Independent merge per folder
@@ -717,8 +725,8 @@ def generate_execution_script_multi(output_folder, folder_names, ref_name):
         input_xml = f"xml_merging_{name}.xml"
         output_dir = f"Stitched_{name}"
         lines.append(f'echo Merging [{name}]...')
-        lines.append(f'if not exist "{output_dir}" mkdir "{output_dir}"')
-        lines.append(f'terastitcher --merge --projin="{input_xml}" --volout="{output_dir}" --resolutions=024 --imout_depth={imout_depth} --sparse_data')
+        lines.append(f'if not exist "{BD}{output_dir}" mkdir "{BD}{output_dir}"')
+        lines.append(f'terastitcher --merge --projin="{BD}{input_xml}" --volout="{BD}{output_dir}" --resolutions=024 --imout_depth={imout_depth} --sparse_data')
         lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
 
     lines.append("\necho Stitching Completed Successfully!")
