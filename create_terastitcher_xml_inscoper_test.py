@@ -585,64 +585,70 @@ def create_propagation_script_multi(output_folder, ref_name, folder_names, raw_d
     path_map_str += "}"
 
     content = f"""
-import xml.etree.ElementTree as ET
 import os
 import sys
 
 # AUTO-GENERATED SCRIPT to propagate TeraStitcher alignments (multi-folder mode)
-# Each folder is one channel -- all use c0 internally.  We only swap paths.
+# Each folder is one channel -- all use c0 internally.
+# Strategy: read the aligned XML as plain text, do a string-replace of the
+# reference RAW_DATA path with the satellite's.  This preserves the exact XML
+# formatting, declaration, and attribute order that TeraStitcher wrote -- far
+# safer than round-tripping through an XML parser.
 REF_FOLDER = {repr(ref_name)}
 FOLDER_NAMES = {repr(folder_names)}
 RAW_DATA_PATHS = {path_map_str}
 
 def main():
     # Ensure we run from the script's own directory
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(script_dir)
+    print(f"Working directory: {{script_dir}}")
     print("--- Running XML Propagation Step (multi-folder) ---")
-    aligned_xml = f"xml_merging_{{REF_FOLDER}}.xml"
 
-    if not os.path.exists(aligned_xml):
-        print(f"Error: Aligned file {{aligned_xml}} not found! Alignment failed?")
+    aligned_xml = f"xml_merging_{{REF_FOLDER}}.xml"
+    aligned_path = os.path.join(script_dir, aligned_xml)
+
+    if not os.path.exists(aligned_path):
+        print(f"Error: Aligned file not found at: {{aligned_path}}")
+        print("Contents of directory:")
+        for f in sorted(os.listdir(script_dir)):
+            if f.endswith(".xml"):
+                print(f"  {{f}}")
         sys.exit(1)
 
-    print(f"Cloning alignment from reference: {{aligned_xml}}")
+    # Read the reference XML as raw text
+    with open(aligned_path, 'r', encoding='utf-8') as f:
+        ref_xml_text = f.read()
+
+    print(f"Read reference XML: {{aligned_path}} ({{len(ref_xml_text)}} bytes)")
 
     ref_raw = RAW_DATA_PATHS[REF_FOLDER]
+    # Also handle the path with forward slashes (TeraStitcher may normalise)
+    ref_raw_fwd = ref_raw.replace(os.sep, '/')
 
     for folder_name in FOLDER_NAMES:
         if folder_name == REF_FOLDER:
             continue
 
-        target_xml = f"xml_merging_{{folder_name}}.xml"
+        target_xml = os.path.join(script_dir, f"xml_merging_{{folder_name}}.xml")
         sat_raw = RAW_DATA_PATHS[folder_name]
+        sat_raw_fwd = sat_raw.replace(os.sep, '/')
 
-        try:
-            tree = ET.parse(aligned_xml)
-            root = tree.getroot()
+        # Replace every occurrence of the reference path with the satellite path
+        sat_xml_text = ref_xml_text
+        sat_xml_text = sat_xml_text.replace(ref_raw, sat_raw)
+        if ref_raw_fwd != ref_raw:
+            sat_xml_text = sat_xml_text.replace(ref_raw_fwd, sat_raw_fwd)
 
-            # 1. Swap stacks_dir -> satellite folder's RAW_DATA
-            stacks_node = root.find("stacks_dir")
-            if stacks_node is not None:
-                stacks_node.set("value", sat_raw)
+        with open(target_xml, 'w', encoding='utf-8') as f:
+            f.write(sat_xml_text)
 
-            # 2. Swap mdata_bin path
-            mdata_node = root.find("mdata_bin")
-            if mdata_node is not None:
-                old_val = mdata_node.get("value")
-                new_val = old_val.replace(ref_raw, sat_raw)
-                mdata_node.set("value", new_val)
-
-            stacks = root.findall(".//Stack")
-            print(f"  -> Generating {{target_xml}} ({{len(stacks)}} stacks)...")
-
-            for stack in stacks:
-                stack.set("STITCHABLE", "no")
-
-            tree.write(target_xml)
-            print(f"     [OK] Saved {{target_xml}}")
-
-        except Exception as e:
-            print(f"Error processing {{folder_name}}: {{e}}")
+        # Verify
+        if os.path.exists(target_xml):
+            size = os.path.getsize(target_xml)
+            print(f"  [OK] {{target_xml}} ({{size}} bytes)")
+        else:
+            print(f"  [FAIL] Could not write {{target_xml}}")
             sys.exit(1)
 
     print("Propagation complete.")
@@ -719,12 +725,22 @@ def generate_execution_script_multi(output_folder, folder_names, ref_name):
     lines.append(f'{sys.executable} "{BD}propagate_xmls.py"')
     lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
 
+    # Verify all merging XMLs exist after propagation
+    lines.append("\necho --- Verifying merging XMLs ---")
+    for name in folder_names:
+        xml_file = f"xml_merging_{name}.xml"
+        lines.append(f'if not exist "{BD}{xml_file}" (')
+        lines.append(f'    echo ERROR: Missing {xml_file} - propagation failed for [{name}]')
+        lines.append(f'    GOTO ERROR')
+        lines.append(f')')
+        lines.append(f'echo   [OK] {xml_file}')
+
     # 5. Independent merge per folder
     lines.append("\n" + "echo --- Phase 4: Merging All Folders Independently ---")
     for name in folder_names:
         input_xml = f"xml_merging_{name}.xml"
         output_dir = f"Stitched_{name}"
-        lines.append(f'echo Merging [{name}]...')
+        lines.append(f'echo Merging [{name}] using {BD}{input_xml}...')
         lines.append(f'if not exist "{BD}{output_dir}" mkdir "{BD}{output_dir}"')
         lines.append(f'terastitcher --merge --projin="{BD}{input_xml}" --volout="{BD}{output_dir}" --resolutions=024 --imout_depth={imout_depth} --sparse_data')
         lines.append("IF %ERRORLEVEL% NEQ 0 GOTO ERROR")
